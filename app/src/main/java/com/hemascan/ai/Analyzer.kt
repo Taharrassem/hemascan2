@@ -4,11 +4,8 @@ import android.graphics.Bitmap
 import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
-import kotlin.math.PI
-import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sqrt
 
 data class Cell(val x: Float, val y: Float, val r: Float, val label: String, val conf: Float)
 
@@ -17,6 +14,8 @@ object Analyzer {
     const val UNCERTAIN = "Incertaine"
     const val WBC = "Leucocyte (suggestion)"
     const val PLT = "Plaquette (suggestion)"
+
+    private fun ell(k: Int) = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(k.toDouble(), k.toDouble()))
 
     fun enhance(src: Bitmap): Bitmap {
         val m = Mat(); Utils.bitmapToMat(src, m)
@@ -33,9 +32,31 @@ object Analyzer {
         return out
     }
 
+    private fun otsu(c8: Mat, mask: Mat): Double {
+        val hist = Mat()
+        Imgproc.calcHist(listOf(c8), MatOfInt(0), mask, hist, MatOfInt(256), MatOfFloat(0f, 256f))
+        val h = DoubleArray(256) { hist.get(it, 0)[0] }
+        val total = h.sum()
+        var sumAll = 0.0
+        for (i in 0..255) sumAll += i * h[i]
+        var wB = 0.0; var sumB = 0.0; var best = 0.0; var thr = 0.0
+        for (t in 0..255) {
+            wB += h[t]
+            if (wB == 0.0) continue
+            val wF = total - wB
+            if (wF == 0.0) break
+            sumB += t * h[t]
+            val mB = sumB / wB
+            val mF = (sumAll - sumB) / wF
+            val v = wB * wF * (mB - mF) * (mB - mF)
+            if (v > best) { best = v; thr = t.toDouble() }
+        }
+        return thr
+    }
+
     private fun localMax(dist: Mat, k: Int, minR: Double): Mat {
         val dil = Mat()
-        Imgproc.dilate(dist, dil, Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(k.toDouble(), k.toDouble())))
+        Imgproc.dilate(dist, dil, ell(k))
         val eq = Mat(); Core.compare(dist, dil, eq, Core.CMP_EQ)
         val above = Mat(); Core.compare(dist, Scalar(minR), above, Core.CMP_GT)
         Core.bitwise_and(eq, above, eq)
@@ -55,63 +76,62 @@ object Analyzer {
     }
 
     /** sens : 0.5 (strict) à 1.5 (sensible). */
-    fun detect(src: Bitmap, sens: Float = 1f): List<Cell> {
+    fun detect(src: Bitmap, sens: Float = 1f): List<Cell> = try {
+        detectImpl(src, sens)
+    } catch (e: Throwable) {
+        listOf(Cell(40f, 40f, 30f, "ERREUR: ${e.javaClass.simpleName} ${e.message}".take(90), 0f))
+    }
+
+    private fun detectImpl(src: Bitmap, sens: Float): List<Cell> {
         val f = min(1f, 1200f / max(src.width, src.height))
         val bmp = if (f < 1f) Bitmap.createScaledBitmap(src, (src.width * f).toInt(), (src.height * f).toInt(), true) else src
         val rgba = Mat(); Utils.bitmapToMat(bmp, rgba)
         val rgb = Mat(); Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-        val gray = Mat(); Imgproc.cvtColor(rgb, gray, Imgproc.COLOR_RGB2GRAY)
-        Imgproc.GaussianBlur(gray, gray, Size(7.0, 7.0), 0.0)
-        val w = gray.cols(); val h = gray.rows()
+        val w = rgb.cols(); val h = rgb.rows()
 
-        // 1. Champ circulaire du microscope (on ignore le noir autour)
-        val pw = max(4, w / 20); val ph = max(4, h / 20)
-        val corner = (Core.mean(gray.submat(0, ph, 0, pw)).`val`[0] + Core.mean(gray.submat(0, ph, w - pw, w)).`val`[0] +
-            Core.mean(gray.submat(h - ph, h, 0, pw)).`val`[0] + Core.mean(gray.submat(h - ph, h, w - pw, w)).`val`[0]) / 4
-        val center = Core.mean(gray.submat(h * 2 / 5, h * 3 / 5, w * 2 / 5, w * 3 / 5)).`val`[0]
-        val mask = Mat.zeros(h, w, CvType.CV_8UC1)
-        var circle = false; var cx = w / 2.0; var cy = h / 2.0; var fr = 1e9
-        if (corner < 0.5 * center && center > 60) {
-            val m = Mat(); Imgproc.threshold(gray, m, max(40.0, 0.45 * center), 255.0, Imgproc.THRESH_BINARY)
-            val mo = Imgproc.moments(m, true)
-            if (mo.m00 > 100) { circle = true; cx = mo.m10 / mo.m00; cy = mo.m01 / mo.m00; fr = sqrt(mo.m00 / PI) }
+        // 1. Carte de "chroma" Lab : le fond noir/gris du microscope a ~0, le rose ~20, les cellules violettes 50+
+        val blur = Mat(); Imgproc.GaussianBlur(rgb, blur, Size(5.0, 5.0), 0.0)
+        val lab = Mat(); Imgproc.cvtColor(blur, lab, Imgproc.COLOR_RGB2Lab)
+        val ch = ArrayList<Mat>(); Core.split(lab, ch)
+        val a = Mat(); val b = Mat()
+        ch[1].convertTo(a, CvType.CV_32F, 1.0, -128.0)
+        ch[2].convertTo(b, CvType.CV_32F, 1.0, -128.0)
+        val chroma = Mat(); Core.magnitude(a, b, chroma)
+
+        // 2. Champ du microscope = plus grande zone colorée, remplie
+        val fld32 = Mat(); Imgproc.threshold(chroma, fld32, 7.0, 255.0, Imgproc.THRESH_BINARY)
+        val fld = Mat(); fld32.convertTo(fld, CvType.CV_8U)
+        Imgproc.morphologyEx(fld, fld, Imgproc.MORPH_CLOSE, ell(15))
+        val lbl = Mat(); val st = Mat(); val ce = Mat()
+        val n = Imgproc.connectedComponentsWithStats(fld, lbl, st, ce)
+        if (n < 2) return emptyList()
+        var bi = 1; var ba = 0.0
+        for (i in 1 until n) {
+            val ar = st.get(i, Imgproc.CC_STAT_AREA)[0]
+            if (ar > ba) { ba = ar; bi = i }
         }
-        if (circle) Imgproc.circle(mask, Point(cx, cy), (fr * 0.97).toInt(), Scalar(255.0), -1)
-        else mask.setTo(Scalar(255.0))
+        val bigMask = Mat(); Core.compare(lbl, Scalar(bi.toDouble()), bigMask, Core.CMP_EQ)
+        val fc = ArrayList<MatOfPoint>()
+        Imgproc.findContours(bigMask.clone(), fc, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        val field = Mat.zeros(h, w, CvType.CV_8UC1)
+        Imgproc.drawContours(field, fc, -1, Scalar(255.0), -1)
+        Imgproc.erode(field, field, ell(9))
+        val fdist = Mat(); Imgproc.distanceTransform(field, fdist, Imgproc.DIST_L2, 5)
 
-        // 2. Carte de différence de couleur avec le fond (Lab)
-        val lab = Mat(); Imgproc.cvtColor(rgb, lab, Imgproc.COLOR_RGB2Lab)
-        val labs = ArrayList<Mat>(); Core.split(lab, labs)
-        val ms = MatOfDouble(); val sd = MatOfDouble()
-        Core.meanStdDev(labs[0], ms, sd, mask)
-        val bright = Mat()
-        Imgproc.threshold(labs[0], bright, ms.get(0, 0)[0] + 0.2 * sd.get(0, 0)[0], 255.0, Imgproc.THRESH_BINARY)
-        Core.bitwise_and(bright, mask, bright)
-        val bg = if (Core.countNonZero(bright) > 50) Core.mean(lab, bright) else Core.mean(lab, mask)
-        val lab32 = Mat(); lab.convertTo(lab32, CvType.CV_32FC3)
-        Core.subtract(lab32, Scalar(bg.`val`[0], bg.`val`[1], bg.`val`[2], 0.0), lab32)
-        Core.multiply(lab32, lab32, lab32)
-        val chs = ArrayList<Mat>(); Core.split(lab32, chs)
-        val sum = Mat(); Core.add(chs[0], chs[1], sum); Core.add(sum, chs[2], sum)
-        Core.sqrt(sum, sum)
-        val d8 = Mat(); sum.convertTo(d8, CvType.CV_8U, 255.0 / 100.0)
-
-        // 3. Seuillage
-        val masked = Mat(); d8.copyTo(masked, mask)
-        val tmp = Mat()
-        val otsu = Imgproc.threshold(masked, tmp, 0.0, 255.0, Imgproc.THRESH_BINARY or Imgproc.THRESH_OTSU)
-        val bin = Mat()
-        Imgproc.threshold(masked, bin, (otsu / sens).coerceIn(8.0, 90.0), 255.0, Imgproc.THRESH_BINARY)
-        Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_OPEN, Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(3.0, 3.0)))
-        Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_CLOSE, Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(7.0, 7.0)))
+        // 3. Seuil d'Otsu sur la chroma, dans le champ uniquement
+        val c8 = Mat(); chroma.convertTo(c8, CvType.CV_8U, 3.0)
+        val t = (otsu(c8, field) / sens).coerceIn(10.0, 240.0)
+        val bin = Mat(); Imgproc.threshold(c8, bin, t, 255.0, Imgproc.THRESH_BINARY)
+        Core.bitwise_and(bin, field, bin)
+        Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_OPEN, ell(3))
         val cts = ArrayList<MatOfPoint>()
         Imgproc.findContours(bin.clone(), cts, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        val keep = cts.filter { Imgproc.contourArea(it) >= 40 }
+        if (keep.isEmpty()) return emptyList()
         val filled = Mat.zeros(h, w, CvType.CV_8UC1)
-        val big = cts.filter { Imgproc.contourArea(it) >= 50 }
-        if (big.isEmpty()) return emptyList()
-        Imgproc.drawContours(filled, big, -1, Scalar(255.0), -1)
+        Imgproc.drawContours(filled, keep, -1, Scalar(255.0), -1)
 
-        // 4. Séparation des cellules collées (maxima locaux de la carte de distance)
+        // 4. Séparation des cellules collées
         val dist = Mat(); Imgproc.distanceTransform(filled, dist, Imgproc.DIST_L2, 5)
         val p1 = comps(localMax(dist, 7, 3.0), dist)
         if (p1.isEmpty()) return emptyList()
@@ -121,21 +141,22 @@ object Analyzer {
         val raw = comps(localMax(dist, k, max(3.0, 0.35 * rTyp)), dist).sortedByDescending { it[2] }.take(2500)
         if (raw.isEmpty()) return emptyList()
 
-        // 5. Caractéristiques et suggestions (taille + intensité de coloration)
+        // 5. Suggestions simples (taille + intensité) et cellules incertaines
         val dens = raw.map { c ->
             val r = max(2, (c[2] * 0.6).toInt()); val x = c[0].toInt(); val y = c[1].toInt()
             val x0 = max(0, x - r); val x1 = min(w, x + r + 1); val y0 = max(0, y - r); val y1 = min(h, y + r + 1)
-            if (x1 <= x0 || y1 <= y0) 0.0 else Core.mean(d8.submat(y0, y1, x0, x1)).`val`[0]
+            if (x1 <= x0 || y1 <= y0) 0.0 else Core.mean(c8.submat(y0, y1, x0, x1)).`val`[0]
         }
         val medR = raw.map { it[2] }.sorted()[raw.size / 2]
         val medD = dens.sorted()[raw.size / 2]
         return raw.mapIndexed { i, c ->
             val r = c[2]
-            val edge = if (circle) hypot(c[0] - cx, c[1] - cy) + r > fr * 0.95
-            else c[0] < r || c[1] < r || c[0] > w - r || c[1] > h - r
+            val xi = c[0].toInt().coerceIn(0, w - 1); val yi = c[1].toInt().coerceIn(0, h - 1)
+            val edge = fdist.get(yi, xi)[0] < 0.9 * r ||
+                c[0] < r || c[1] < r || c[0] > w - r || c[1] > h - r
             val (label, conf) = when {
                 edge || r > 1.8 * medR -> Pair(UNCERTAIN, 0f)
-                r > 1.25 * medR && dens[i] > 1.4 * medD -> Pair(WBC, 0.4f)
+                r > 1.25 * medR && dens[i] > 1.25 * medD -> Pair(WBC, 0.4f)
                 r < 0.5 * medR -> Pair(PLT, 0.3f)
                 else -> Pair(UNCLASSIFIED, 0f)
             }
