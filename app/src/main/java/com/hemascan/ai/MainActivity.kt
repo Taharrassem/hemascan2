@@ -154,8 +154,8 @@ fun App(cvOk: Boolean) {
                             val f = File(ctx.cacheDir, "cam_${System.currentTimeMillis()}.jpg")
                             val u = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", f)
                             camUri = u; cam.launch(u)
-                        }, Modifier.weight(1f)) { Text("📷 Photo") }
-                        Button(onClick = { pick.launch("image/*") }, Modifier.weight(1f)) { Text("🖼️ Importer") }
+                        }, modifier = Modifier.weight(1f)) { Text("📷 Photo") }
+                        Button(onClick = { pick.launch("image/*") }, modifier = Modifier.weight(1f)) { Text("🖼️ Importer") }
                     }
                     if (p == null) {
                         Card(Modifier.fillMaxWidth()) {
@@ -176,22 +176,22 @@ fun App(cvOk: Boolean) {
                             if (busy > 0) "Analyse en cours…" else "${p.cells.size} cellules · $unc incertaines",
                             style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold
                         )
-                        if (busy > 0) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        if (busy > 0) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         Viewer(p, show, filter, sel) { sel = it }
                         Text("Pincez pour zoomer, double-tap pour réinitialiser, touchez une cellule pour la classer.", style = MaterialTheme.typography.labelSmall)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(enabled = busy == 0, onClick = {
+                            OutlinedButton(onClick = {
                                 scope.launch {
                                     busy += 1
                                     val nb = withContext(Dispatchers.Default) { Analyzer.enhance(p.bmp) }
                                     photos[cur] = Photo(nb); busy -= 1; run(cur)
                                 }
-                            }, Modifier.weight(1f)) { Text("✨ Améliorer") }
-                            Button(enabled = busy == 0, onClick = { run(cur) }, Modifier.weight(1f)) { Text("🔄 Re-détecter") }
+                            }, modifier = Modifier.weight(1f), enabled = busy == 0) { Text("✨ Améliorer") }
+                            Button(onClick = { run(cur) }, modifier = Modifier.weight(1f), enabled = busy == 0) { Text("🔄 Re-détecter") }
                         }
                         Text("Sensibilité de détection", style = MaterialTheme.typography.labelLarge)
                         Slider(value = sens, onValueChange = { sens = it }, valueRange = 0.5f..1.5f, onValueChangeFinished = { run(cur) })
-                        Row { Text("Afficher les annotations", Modifier.weight(1f)); Switch(show, { show = it }) }
+                        Row { Text("Afficher les annotations", Modifier.weight(1f)); Switch(checked = show, onCheckedChange = { show = it }) }
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             item { FilterChip(selected = filter == null, onClick = { filter = null }, label = { Text("Tout") }) }
                             items(p.cells.map { it.label }.distinct()) { l ->
@@ -224,7 +224,7 @@ fun App(cvOk: Boolean) {
                     if (p == null) Text("Aucune analyse pour l'instant.") else {
                         Text("Photo ${cur + 1} : ${p.cells.size} cellules", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Bars(p.cells)
-                        Button(onClick = { exportCsv(ctx, photos) }, Modifier.fillMaxWidth()) { Text("📤 Exporter en CSV (toutes les photos)") }
+                        Button(onClick = { exportCsv(ctx, photos) }, modifier = Modifier.fillMaxWidth()) { Text("📤 Exporter en CSV (toutes les photos)") }
                     }
                 }
                 else -> {
